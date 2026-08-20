@@ -5,30 +5,24 @@ import sys
 import os
 import csv
 import pytz
-from datetime import datetime, timedelta
+from datetime import datetime
 
-class MT5SMCEngineV4_1:
+class MT5SMCEngineV4_2:
     def __init__(self, symbol="US500"):
         self.symbol = symbol
-
-       # =====================================================================
-        # [1] ARCHITEKTURA KAPITAŁU I RYZYKA (SKALOWALNA)
+        
+        # =====================================================================
+        # [1] ARCHITEKTURA KAPITAŁU I RYZYKA (SZTYWNE LIMITY PROP FIRM)
         # =====================================================================
         self.initial_balance = 10000.0   
+        self.base_risk_usd = 50.0        # Sztywne ryzyko 50 USD na trade
         
-        # Definicja parametrów procentowych (Skalowanie konta)
-        self.risk_per_trade_pct = 0.005  # Ryzyko na trade (0.5%)
-        self.daily_loss_pct = 0.04       # Dzienny bufor bezpieczeństwa (4.0% - chroni przed 5% Prop Firmy)
-        self.total_loss_pct = 0.09       # Całkowity bufor bezpieczeństwa (8.0% - chroni przed 10% Prop Firmy)
+        self.max_lot_cap = 0.3           # SZTYWNY KAGANIEC WOLUMENU 
+            
+        self.max_daily_trades = 2        
+        self.daily_loss_limit = -400.0   
+        self.total_loss_limit = 9200.0   
         
-        # Matematyczna kompilacja na twarde dolary (Zawsze od bazy!)
-        self.base_risk_usd = self.initial_balance * self.risk_per_trade_pct
-        self.daily_loss_limit = -(self.initial_balance * self.daily_loss_pct)
-        self.total_loss_limit = self.initial_balance * (1.0 - self.total_loss_pct)
-
-        self.max_lot_cap = 0.3 #Max lota, można dostosować do wymagań brokera lub preferencji
-        self.max_daily_trades = 2 #Maksymalna liczba tradeów
-
         # Ścieżki
         script_dir = os.path.dirname(os.path.abspath(__file__))
         self.log_file = os.path.join(script_dir, f"live_trade_journal_{self.symbol}.csv")
@@ -36,7 +30,7 @@ class MT5SMCEngineV4_1:
         # =====================================================================
         # [2] INICJALIZACJA I PAMIĘĆ (PERSISTENCE)
         # =====================================================================
-        print(f"⚙️ Inicjalizacja Głównego Inżyniera V4.1 (True SMC) dla {self.symbol}...")
+        print(f"⚙️ Inicjalizacja Głównego Inżyniera V4.2 (Temporal Lock & H4 Bias) dla {self.symbol}...")
         if not mt5.initialize():
             print(f"🛑 BŁĄD MT5: {mt5.last_error()}"); sys.exit()
         if not mt5.symbol_select(self.symbol, True):
@@ -54,8 +48,8 @@ class MT5SMCEngineV4_1:
         self.asr_high = None             
         self.asr_low = None              
         self.liquidity_swept = None
-        self.structural_point = None     # Zapisany poziom pęknięcia struktury
-        self.sweep_extremum = None       # Zapisany absolutny dołek/szczyt po wybiciu
+        self.structural_point = None     
+        self.sweep_extremum = None       
         
         self.in_position = False
         self.position_type = ""
@@ -79,7 +73,6 @@ class MT5SMCEngineV4_1:
                                  "Exit_Price", "Result", "PnL", "Balance_After", "Daily_PnL"])
 
     def load_state_from_csv(self):
-        """Żelazna pamięć. Odtwarza stan konta i liczy dzisiejsze operacje, uodparniając na resety."""
         balance = self.initial_balance
         d_pnl = 0.0
         trades_today = 0
@@ -89,12 +82,9 @@ class MT5SMCEngineV4_1:
                 df = pd.read_csv(self.log_file)
                 if not df.empty:
                     balance = float(df['Balance_After'].iloc[-1])
-                    
-                    # Liczymy transakcje tylko z dzisiaj
                     df['Exit_Time'] = pd.to_datetime(df['Exit_Time'])
                     today_str = datetime.now().strftime('%Y-%m-%d')
                     today_trades = df[df['Exit_Time'].dt.strftime('%Y-%m-%d') == today_str]
-                    
                     trades_today = len(today_trades)
                     d_pnl = today_trades['PnL'].sum()
             except Exception as e:
@@ -116,7 +106,27 @@ class MT5SMCEngineV4_1:
         return datetime.now(pytz.utc).astimezone(pytz.timezone('America/New_York'))
 
     # =====================================================================
-    # [MODUŁ GEOMETRII RYNKU - SILNIK SMC V4.1]
+    # [MODUŁ ANALIZY WYŻSZEGO INTERWAŁU (HTF BIAS)]
+    # =====================================================================
+    def get_htf_bias(self):
+        """
+        Skanuje wykres 4-godzinny (H4), aby ustalić nadrzędny kierunek rynku.
+        """
+        rates_h4 = mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_H4, 0, 10)
+        if rates_h4 is None: return "NEUTRAL"
+        df_h4 = pd.DataFrame(rates_h4)
+        
+        close_current = df_h4.iloc[-2]['close']
+        prev_close = df_h4.iloc[-3]['close']
+        
+        if close_current > prev_close:
+            return "BULLISH"
+        elif close_current < prev_close:
+            return "BEARISH"
+        return "NEUTRAL"
+
+    # =====================================================================
+    # [MODUŁ GEOMETRII RYNKU - SILNIK SMC V4.2]
     # =====================================================================
     def update_market_context(self):
         rates = mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_M5, 0, 300)
@@ -127,34 +137,24 @@ class MT5SMCEngineV4_1:
         if daily_rates is not None:
             self.midnight_price = daily_rates[0]['open']
 
-        # Zasięg Azji
         asian_df = df.iloc[-80:-20]
         self.asr_high = asian_df['high'].max()
         self.asr_low = asian_df['low'].min()
 
-        # Detekcja zebrania płynności
         current_price = df.iloc[-1]['close']
         recent_high = df.iloc[-20:]['high'].max()
         recent_low = df.iloc[-20:]['low'].min()
         
-        # BULLISH SWEEP: Zeszli pod dołek z Azji, wycięli płynność
         if recent_low < self.asr_low and current_price > self.asr_low:
             self.liquidity_swept = "BULLISH"
-            # Znajdujemy absolutny dołek tego wybicia (tu wyląduje nasz SL)
             self.sweep_extremum = recent_low
-            
-            # Szukamy struktury do wybicia: najwyższy punkt po zebraniu płynności a przed aktualną świecą
             sweep_index = df[df['low'] == self.sweep_extremum].index[-1]
             if sweep_index < len(df) - 1:
                 self.structural_point = df.iloc[sweep_index:-1]['high'].max()
                 
-        # BEARISH SWEEP: Wyszli nad szczyt z Azji, wycięli płynność
         elif recent_high > self.asr_high and current_price < self.asr_high:
             self.liquidity_swept = "BEARISH"
-            # Znajdujemy absolutny szczyt tego wybicia (tu wyląduje nasz SL)
             self.sweep_extremum = recent_high
-            
-            # Szukamy struktury do wybicia: najniższy punkt po zebraniu płynności a przed aktualną świecą
             sweep_index = df[df['high'] == self.sweep_extremum].index[-1]
             if sweep_index < len(df) - 1:
                 self.structural_point = df.iloc[sweep_index:-1]['low'].min()
@@ -162,20 +162,21 @@ class MT5SMCEngineV4_1:
         return df
 
     def detect_market_structure_shift(self, df):
-        """Prawdziwa detekcja łamania struktury z PDFa."""
+        """Detekcja MSS z twardą blokadą trendu z interwału H4."""
         if not self.liquidity_swept or not self.structural_point: return None
         
-        c = df.iloc[-2] # Ostatnia zamknięta świeca
+        htf_bias = self.get_htf_bias()
+        c = df.iloc[-2] 
         
         if self.liquidity_swept == "BULLISH":
+            if htf_bias == "BEARISH": return None 
             if self.midnight_price and c['close'] < self.midnight_price:
-                # Jeśli cena zamyka się fizycznie nad lokalną strukturą = MSS Potwierdzone
                 if c['close'] > self.structural_point:
                     return "BUY"
                     
         elif self.liquidity_swept == "BEARISH":
+            if htf_bias == "BULLISH": return None
             if self.midnight_price and c['close'] > self.midnight_price:
-                # Jeśli cena zamyka się fizycznie pod lokalną strukturą = MSS Potwierdzone
                 if c['close'] < self.structural_point:
                     return "SELL"
         return None
@@ -183,13 +184,18 @@ class MT5SMCEngineV4_1:
     # =====================================================================
     # [MODUŁ EGZEKUCJI I KALKULACJI LOTA]
     # =====================================================================
-    def is_trading_allowed(self):
+    def is_trading_allowed(self, tick):
         if self.virtual_balance <= self.total_loss_limit:
             return False, f"TOTAL DRAWDOWN REACHED (${self.virtual_balance:.2f})"
         if self.daily_pnl <= self.daily_loss_limit:
             return False, f"DAILY LIMIT REACHED ({-self.daily_pnl}$)"
         if self.daily_trades_count >= self.max_daily_trades:
             return False, "MAX 2 TRADES/DAY REACHED"
+            
+        # Ochrona czasowa z CSV: Godziny 09:00 - 10:00 to 80% strat.
+        server_time = datetime.fromtimestamp(tick.time)
+        if server_time.hour >= 9:
+            return False, f"CSV LOCK: STREFA ŚMIERCI (>09:00 SERWERA)"
             
         ny_time = self.get_ny_time()
         if not (1 <= ny_time.hour < 5):
@@ -208,14 +214,11 @@ class MT5SMCEngineV4_1:
         self.daily_trades_count += 1 
         
         sym_info = mt5.symbol_info(self.symbol)
-        
-        # SL leży dokładnie na ekstremum wybicia (SMC Rule) + minimalny bufor ochronny
-        buffer = sym_info.trade_tick_size * 20 # mały spread bufor
+        buffer = sym_info.trade_tick_size * 20 
         
         if order_type == "BUY":
             self.sl_price = self.sweep_extremum - buffer
             dist = self.entry_price - self.sl_price
-            # Zabezpieczenie przed mikroskopijnym SL
             if dist < (sym_info.trade_tick_size * 50): 
                 dist = sym_info.trade_tick_size * 50
                 self.sl_price = self.entry_price - dist
@@ -228,7 +231,6 @@ class MT5SMCEngineV4_1:
                 self.sl_price = self.entry_price + dist
             self.tp_price = self.entry_price - (dist * 2.0)
             
-        # Prawidłowa kalkulacja lota dostosowana do MT5
         ticks_at_risk = dist / sym_info.trade_tick_size
         monetary_risk_per_lot = ticks_at_risk * sym_info.trade_tick_value
         
@@ -237,10 +239,8 @@ class MT5SMCEngineV4_1:
         else:
             calculated_lots = 0.01
             
-        # Ograniczanie kagańcem i krokami brokera
         self.actual_lots = min(calculated_lots, self.max_lot_cap)
         self.actual_lots = max(self.actual_lots, sym_info.volume_min)
-        # Zaokrąglenie do właściwego kroku lota
         step = sym_info.volume_step
         self.actual_lots = round(self.actual_lots / step) * step
         
@@ -312,7 +312,7 @@ class MT5SMCEngineV4_1:
                 self.manage_position(tick)
                 
                 if not self.in_position and loop_counter % 10 == 0:
-                    allowed, reason = self.is_trading_allowed()
+                    allowed, reason = self.is_trading_allowed(tick)
                     if allowed:
                         df = self.update_market_context()
                         if df is not False:
@@ -322,19 +322,20 @@ class MT5SMCEngineV4_1:
                 
                 if loop_counter % 20 == 0:
                     status = "W POZYCJI" if self.in_position else "NASŁUCH"
-                    allowed, reason = self.is_trading_allowed()
+                    allowed, reason = self.is_trading_allowed(tick)
                     mss_info = f" | Struktura: {self.structural_point:.{self.digits}f}" if self.structural_point else ""
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] {self.symbol} | ASR: {self.liquidity_swept or 'Brak'}{mss_info} | Śluza: {reason} | {status}")
+                    htf = self.get_htf_bias()
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] {self.symbol} | ASR: {self.liquidity_swept or 'Brak'}{mss_info} | H4: {htf} | Śluza: {reason} | {status}")
                 
                 loop_counter += 1
                 time.sleep(1)
                 
         except KeyboardInterrupt:
-            print(f"\n🛑 Zatrzymano V4.1 dla {self.symbol}.")
+            print(f"\n🛑 Zatrzymano V4.2 dla {self.symbol}.")
         finally:
             mt5.shutdown()
 
 if __name__ == "__main__":
     target_symbol = sys.argv[1] if len(sys.argv) > 1 else "US500"
-    bot = MT5SMCEngineV4_1(symbol=target_symbol)
+    bot = MT5SMCEngineV4_2(symbol=target_symbol)
     bot.run()
