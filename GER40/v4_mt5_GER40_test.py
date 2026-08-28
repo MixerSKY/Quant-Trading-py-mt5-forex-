@@ -192,11 +192,6 @@ class MT5SMCEngineV4_2:
         if self.daily_trades_count >= self.max_daily_trades:
             return False, "MAX 2 TRADES/DAY REACHED"
             
-        # Ochrona czasowa z CSV: Godziny 09:00 - 10:00 to 80% strat.
-        server_time = datetime.fromtimestamp(tick.time)
-        if server_time.hour >= 9:
-            return False, f"CSV LOCK: STREFA ŚMIERCI (>09:00 SERWERA)"
-            
         ny_time = self.get_ny_time()
         if not (1 <= ny_time.hour < 5):
             return False, "OUTSIDE LONDON KILLZONE (01:00-05:00 NY)"
